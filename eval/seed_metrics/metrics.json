@@ -1,0 +1,23 @@
+{
+  "note": "真实数据库计数；没有调用时延和人工质量测量时填 null。种子规则检查不等于模型盲答或人工审定。",
+  "questions": 48,
+  "answer_positions": {
+    "D": 15,
+    "B": 10,
+    "C": 11,
+    "A": 12
+  },
+  "validation_statuses": {
+    "offline_rule_checked": 48
+  },
+  "long_correct_option_count": 0,
+  "model_call_count": 0,
+  "generation_totals": {},
+  "call_statuses": {},
+  "input_tokens": 0,
+  "output_tokens": 0,
+  "latency_ms_median": null,
+  "latency_ms_max": null,
+  "human_quality_rate": null,
+  "attempt_count": 0
+}
