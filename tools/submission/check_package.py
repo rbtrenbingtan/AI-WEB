@@ -291,10 +291,12 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             checks[key] = {'path': str(artifacts[key]), 'status': 'failed',
                            'errors': ['检查未完成（' + type(exc).__name__ + '）'], 'warnings': [], 'details': {}}
+        # Shared reports use portable names rather than local account/workspace paths.
+        checks[key]['path'] = artifacts[key].name
     passed = all(check['status'] == 'passed' for check in checks.values())
     report = {
         'checked_at': datetime.now(timezone.utc).isoformat(),
-        'directory': str(directory), 'status': 'passed' if passed else 'failed',
+        'directory': '.', 'status': 'passed' if passed else 'failed',
         'scope': '本地静态材料检查；只写本报告，不修改材料、不请求模型、不发布远程或提交官网。',
         'checks': checks,
         'manual_review_required': 'PDF 关键词与媒体元数据仅作工程检查；还需人工核对比赛规则、事实、版式、画面与解说。',
