@@ -1,20 +1,213 @@
-import {ArrowRight,BookOpen,Check,CheckCircle2,ChevronRight,Clock3,Flag,Layers3,Loader2,RefreshCw,ShieldCheck,Sparkles,Target,TrendingUp} from 'lucide-react';
-import type {Review} from './types';
-interface Props {review:Review|null;loading:boolean;busy:string;onRefresh:()=>void;onPractice:()=>void;onEvidence:(documentId:string,ids:string[])=>void;onVariant:(questionId:string)=>void;onRevisit:(quizId:string,questionId:string)=>void}
-const states={pending:{label:'待纠正',className:'orange',description:'最近一次涉及该误区时答错'},improving:{label:'纠正中',className:'blue',description:'之后已在 1 道不同题上答对'},corrected:{label:'近期已纠正',className:'green',description:'之后在至少 2 道不同题上答对，且无新错误'}};
-const confidenceLabels={sure:'确定',unsure:'不太确定',guess:'猜的'};
-function shortDate(value:string){const d=new Date(value.endsWith('Z')||/[+-]\d\d:\d\d$/.test(value)?value:value+'Z');return Number.isNaN(d.getTime())?value:d.toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false});}
-export function ReviewPage(p:Props){
- const r=p.review;
- if(p.loading&&!r)return <div className="loading-state"><Loader2 className="spin" size={28}/><h2>正在整理你的学习线索</h2><p>从作答记录中回看每一次理解。</p></div>;
- return <>
-  <section className="page-heading"><div><div className="eyebrow"><span/>REFLECT & GROW</div><h1>看见误区，也看见自己的进步。</h1><p>复习不是从头再来，而是把还模糊的地方，再看清一点。</p></div><button className="text-button" onClick={p.onRefresh} disabled={p.loading}><RefreshCw size={15} className={p.loading?'spin':''}/>刷新记录</button></section>
-  {!r||r.total===0?<div className="empty-state card review-empty"><div className="empty-icon"><Layers3 size={38}/></div><span className="eyebrow">YOUR LEARNING STORY</span><h2>每一次练习，都会在这里留下线索。</h2><p>完成首轮小测后，你可以看到误区变化、知识点记录<br/>以及信心与作答结果的关系。</p><button className="button primary" onClick={p.onPractice}>开始第一次练习<ArrowRight size={17}/></button></div>:<>
-   <div className="stat-grid"><div className="stat-card"><span><Target size={18}/>累计作答</span><strong>{r.total}<small>题</small></strong><p>每题仅计首次作答</p></div><div className="stat-card"><span><CheckCircle2 size={18}/>答对题目</span><strong>{r.correct}<small>题</small></strong><p>包括针对性补练</p></div><div className="stat-card orange-stat"><span><Flag size={18}/>值得优先回顾</span><strong>{r.misconceptions.filter(m=>m.status==='pending').length}<small>个误区</small></strong><p>最近一次涉及该误区时答错</p></div><div className="stat-card green-stat"><span><TrendingUp size={18}/>近期已纠正</span><strong>{r.misconceptions.filter(m=>m.status==='corrected').length}<small>个误区</small></strong><p>之后至少 2 道不同题答对</p></div></div>
-   <div className="review-layout"><section className="card misconception-review"><div className="section-heading"><div><span className="eyebrow">ONE MISCONCEPTION AT A TIME</span><h2>把这些地方，再想清楚。</h2><p>高信心答错优先，其次是最近答错和错误次数。</p></div><span className="section-icon"><Flag size={22}/></span></div>{r.misconceptions.length?r.misconceptions.map(m=><article key={m.id} className="review-misconception"><div className="misconception-heading"><span className="topic-tag">{m.topic_title}</span><span className={`pill ${states[m.status]?.className||'neutral'}`}>{states[m.status]?.label||m.status}</span></div><h3>{m.label}</h3><p>{m.description}</p><div className="misconception-history"><span>答错 {m.wrong_count} 次</span>{m.sure_wrong_count>0&&<span className="priority-note">其中高信心答错 {m.sure_wrong_count} 次</span>}<span>之后不同题答对 {m.distinct_correct} 次</span></div><div className="misconception-bottom"><div className="state-steps" aria-label={states[m.status]?.description}><span className="active"/><i/><span className={m.status!=='pending'?'active':''}/><i/><span className={m.status==='corrected'?'active':''}/><small>{states[m.status]?.description}</small></div><div className="review-actions"><button className="text-button" onClick={()=>p.onEvidence(m.document_id,m.refute_sentence_ids)}><BookOpen size={14}/>看原文</button><button className="button secondary small" disabled={!!p.busy} onClick={()=>p.onVariant(m.question_id)}>{p.busy==='variant'?<Loader2 size={14} className="spin"/>:<RefreshCw size={14}/>}再练一道</button></div></div></article>):<div className="empty-inline"><CheckCircle2 size={23}/><p>目前没有答错误区记录。继续练习，巩固理解。</p></div>}<div className="review-disclaimer"><ShieldCheck size={15}/>状态只描述观察到的练习表现，不代表永久掌握。下一轮会优先混入可用的复测题。</div></section>
-   <aside className="review-side"><section className="card confidence-card"><span className="eyebrow">CONFIDENCE × OUTCOME</span><h2>信心，和答案一起看。</h2><p>「确定但答错」值得优先回顾；<br/>「猜对」也可以再检验一次。</p><div className="quadrant-labels"><span>答对</span><span>答错</span></div><div className="quadrant-row"><span className="row-label">确定</span><div className="quadrant-cell secure"><strong>{r.quadrants.sure_correct}</strong><span>确定且答对</span></div><div className="quadrant-cell caution"><strong>{r.quadrants.sure_wrong}</strong><span>确定但答错</span></div></div><div className="quadrant-row"><span className="row-label">待确认</span><div className="quadrant-cell light"><strong>{r.quadrants.unsure_correct+r.quadrants.guess_correct}</strong><span>犹豫 / 猜测后答对</span></div><div className="quadrant-cell neutral"><strong>{r.quadrants.unsure_wrong+r.quadrants.guess_wrong}</strong><span>犹豫 / 猜测后答错</span></div></div><div className="confidence-breakdown"><span>不太确定：答对 {r.quadrants.unsure_correct} / 答错 {r.quadrants.unsure_wrong}</span><span>猜的：答对 {r.quadrants.guess_correct} / 答错 {r.quadrants.guess_wrong}</span></div></section><section className="card topic-summary"><span className="eyebrow">KNOWLEDGE SNAPSHOT</span><h2>知识点练习记录</h2>{r.topics.map(t=><div className="topic-stat" key={t.id}><div><strong>{t.title}</strong><span>{t.correct}<small> / {t.total}</small></span></div><div className="progress-track"><i style={{width:`${t.total?t.correct/t.total*100:0}%`}}/></div></div>)}<p className="caption">答对次数 / 总作答次数，不是掌握度评分。</p></section></aside></div>
-   {!!r.guess_correct.length&&<section className="card guess-review"><div className="section-heading"><div><span className="eyebrow">A GENTLE SECOND LOOK</span><h2><Sparkles size={20}/>猜对的题，也值得再看一眼。</h2><p>重新阅读题目与原文，确认这次你能说清原因。</p></div><span className="count-badge">{r.guess_correct.length}</span></div>{r.guess_correct.map(item=><button className="guess-item" key={item.question_id} disabled={!!p.busy} onClick={()=>p.onRevisit(item.quiz_id,item.question_id)}><span><Check size={16}/></span><p>{item.stem}</p><small>回看解析</small><ChevronRight size={17}/></button>)}</section>}
-   <section className="card attempt-history"><div className="section-heading"><div><span className="eyebrow">YOUR PRACTICE TRAIL</span><h2>最近练习</h2></div><span className="muted">记录保留在当前浏览器会话</span></div><div className="history-table"><div className="history-head"><span>题目</span><span>信心</span><span>结果</span><span>作答时间</span><span/></div>{r.attempts.slice(0,20).map(a=><button className="history-row" key={a.question_id} disabled={!!p.busy} onClick={()=>p.onRevisit(a.quiz_id,a.question_id)}><span>{a.stem}</span><span>{confidenceLabels[a.confidence]}</span><span className={a.correct?'text-green':'text-orange'}>{a.correct?'答对':'待厘清'}</span><time>{shortDate(a.created_at)}</time><ChevronRight size={16}/></button>)}</div></section>
-  </>}
- </>;
+import {
+  ArrowRight,
+  BookOpen,
+  Check,
+  Loader2,
+  RefreshCw,
+  X,
+} from "lucide-react";
+import type { Review } from "./types";
+interface Props {
+  review: Review | null;
+  loading: boolean;
+  busy: string;
+  onRefresh: () => void;
+  onPractice: () => void;
+  onEvidence: (documentId: string, ids: string[]) => void;
+  onVariant: (questionId: string) => void;
+  onRevisit: (quizId: string, questionId: string) => void;
+}
+const states = {
+  pending: "待纠正",
+  improving: "纠正中",
+  corrected: "近期已纠正",
+};
+const confidenceLabels = { sure: "确定", unsure: "不太确定", guess: "猜的" };
+
+export function ReviewPage(p: Props) {
+  if (!p.review && p.loading)
+    return (
+      <div className="loading-state">
+        <Loader2 className="spin" />
+        加载复习记录…
+      </div>
+    );
+  if (!p.review)
+    return (
+      <div className="card empty-state">
+        <h2>暂时无法读取复习记录</h2>
+        <button className="button primary" onClick={p.onRefresh}>
+          重新读取
+          <RefreshCw size={18} />
+        </button>
+      </div>
+    );
+  const r = p.review;
+  return (
+    <>
+      <header className="page-heading">
+        <h1>我的复习</h1>
+        <button
+          className="text-button"
+          disabled={p.loading}
+          onClick={p.onRefresh}
+        >
+          <RefreshCw size={18} className={p.loading ? "spin" : ""} />
+          刷新记录
+        </button>
+      </header>
+      {r.total === 0 && (
+        <section className="card empty-state">
+          <h2>还没有练习记录</h2>
+          <button className="button primary" onClick={p.onPractice}>
+            开始第一次练习
+            <ArrowRight size={18} />
+          </button>
+        </section>
+      )}
+      {r.total > 0 && (
+        <>
+          <div className="stat-grid">
+            <div className="stat-card">
+              <span>累计作答</span>
+              <strong>{r.total}</strong>
+            </div>
+            <div className="stat-card">
+              <span>答对</span>
+              <strong>{r.correct}</strong>
+            </div>
+            <div className="stat-card">
+              <span>待纠正误区</span>
+              <strong className="text-wrong">
+                {
+                  r.misconceptions.filter((item) => item.status !== "corrected")
+                    .length
+                }
+              </strong>
+            </div>
+          </div>
+          <div className="review-layout">
+            <section className="card misconception-review">
+              <h2>误区记录</h2>
+              {r.misconceptions.length === 0 && (
+                <p className="empty-inline">暂无答错误区</p>
+              )}
+              {r.misconceptions.map((item) => (
+                <article className="review-misconception" key={item.id}>
+                  <div className="misconception-heading">
+                    <span
+                      className={`badge ${item.status === "pending" ? "wrong-badge" : "blue-badge"}`}
+                    >
+                      {states[item.status]}
+                    </span>
+                    <span className="secondary-text">{item.topic_title}</span>
+                  </div>
+                  <h3>{item.label}</h3>
+                  <p>
+                    答错 {item.wrong_count} 次 · 其中确定却答错{" "}
+                    {item.sure_wrong_count} 次 · 后续答对{" "}
+                    {item.distinct_correct} 题
+                  </p>
+                  <div className="button-row">
+                    <button
+                      className="text-button"
+                      onClick={() =>
+                        p.onEvidence(item.document_id, item.refute_sentence_ids)
+                      }
+                    >
+                      <BookOpen size={18} />
+                      看原文
+                    </button>
+                    <button
+                      className="button secondary"
+                      disabled={!!p.busy}
+                      onClick={() => p.onVariant(item.question_id)}
+                    >
+                      {p.busy === `variant:${item.question_id}` ? (
+                        <Loader2 size={18} className="spin" />
+                      ) : (
+                        <RefreshCw size={18} />
+                      )}
+                      再练一道
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </section>
+            <aside className="card confidence-card">
+              <h2>信心与对错</h2>
+              <table className="confidence-matrix">
+                <thead>
+                  <tr>
+                    <th scope="col" />
+                    <th scope="col">答对</th>
+                    <th scope="col">答错</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <th scope="row">确定</th>
+                    <td>{r.quadrants.sure_correct}</td>
+                    <td className="wrong-cell">{r.quadrants.sure_wrong}</td>
+                  </tr>
+                  <tr>
+                    <th scope="row">没把握</th>
+                    <td>
+                      {r.quadrants.unsure_correct + r.quadrants.guess_correct}
+                    </td>
+                    <td className="wrong-cell">
+                      {r.quadrants.unsure_wrong + r.quadrants.guess_wrong}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </aside>
+          </div>
+          <section className="card attempt-history">
+            <h2>最近练习</h2>
+            <div className="history-table">
+              <div className="history-head">
+                <span>题目</span>
+                <span>信心</span>
+                <span>结果</span>
+                <span>时间</span>
+              </div>
+              {r.attempts.slice(0, 20).map((attempt) => (
+                <button
+                  className="history-row"
+                  key={attempt.question_id}
+                  disabled={!!p.busy}
+                  onClick={() =>
+                    p.onRevisit(attempt.quiz_id, attempt.question_id)
+                  }
+                >
+                  <span>{attempt.stem}</span>
+                  <span>{confidenceLabels[attempt.confidence]}</span>
+                  <span
+                    className={attempt.correct ? "text-right" : "text-wrong"}
+                  >
+                    {attempt.correct ? <Check size={16} /> : <X size={16} />}{" "}
+                    {attempt.correct
+                      ? attempt.confidence === "guess"
+                        ? "猜对"
+                        : "答对"
+                      : "答错"}
+                  </span>
+                  <time>
+                    {new Date(attempt.created_at).toLocaleString("zh-CN", {
+                      month: "2-digit",
+                      day: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                      hour12: false,
+                    })}
+                  </time>
+                </button>
+              ))}
+            </div>
+          </section>
+        </>
+      )}
+    </>
+  );
 }

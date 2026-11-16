@@ -1,0 +1,5 @@
+# Only for local report/video assembly; not needed to run the web application.
+imageio-ffmpeg==0.8.1
+Pillow==13.0.0
+reportlab==4.5.1
+pypdf==6.21.4

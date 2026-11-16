@@ -22,6 +22,8 @@ def main():
         if not args.force: parser.error('输出已存在；确认目标后使用 --force')
     if bool(args.source_db)!=bool(args.document_id):
         parser.error('--source-db 和 --document-id 必须同时提供')
+    if args.source_db and args.source_db.resolve()==output:
+        parser.error('导出路径不能与运行数据库相同；请使用独立的输出文件')
     output.parent.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output.parent) as folder:
         temporary=Path(folder)/'seed.sqlite'
@@ -32,6 +34,9 @@ def main():
                 if not source.is_file(): parser.error('源数据库不存在')
                 with sqlite3.connect(f'{source.as_uri()}?mode=ro',uri=True) as src:
                     src.row_factory=sqlite3.Row
+                    # All tables must describe the same generation snapshot, even
+                    # while the live app continues to publish questions in WAL.
+                    src.execute('BEGIN')
                     doc=src.execute('SELECT * FROM documents WHERE id=?',(args.document_id,)).fetchone()
                     if not doc: parser.error('源文档不存在')
                     doc=dict(doc)
@@ -51,7 +56,7 @@ def main():
                     for table,query in queries.items():
                         for row in src.execute(query,(args.document_id,)):
                             conn.execute(f'INSERT INTO {table} VALUES ('+','.join('?' for _ in row)+')',tuple(row))
-            else:
+            if not args.source_db:
                 populate_seed(conn)
         with connect(temporary) as conn:
             conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')

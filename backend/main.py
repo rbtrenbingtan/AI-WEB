@@ -4,7 +4,7 @@ import json
 import os
 import secrets
 import shutil
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -24,6 +24,20 @@ load_dotenv(ROOT/'.env')
 def now(): return datetime.now(timezone.utc).isoformat(timespec='microseconds')
 def uid(prefix): return prefix+'_'+secrets.token_hex(12)
 def dumps(value): return json.dumps(value,ensure_ascii=False)
+
+
+def store_upload(folder: Path, document_id: str, content: bytes) -> Path:
+    """Publish a complete file atomically before the document transaction commits."""
+    folder.mkdir(parents=True, exist_ok=True)
+    destination = folder / f'{document_id}.pdf'
+    temporary = folder / f'{document_id}.part'
+    try:
+        temporary.write_bytes(content)
+        temporary.replace(destination)
+    finally:
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+    return destination
 
 class TopicInput(BaseModel):
     title: str=Field(min_length=1,max_length=80)
@@ -116,10 +130,13 @@ def create_app(data_dir=None):
         if not q: raise HTTPException(404,'练习不存在或无权访问')
         return dict(q)
 
-    def public_question(conn,q,retest=False):
+    def public_question(conn,q,retest=False,is_variant=False):
         payload=json.loads(q['payload'])
         title=conn.execute('SELECT title FROM topics WHERE id=?',(q['topic_id'],)).fetchone()[0]
-        return dict(id=q['id'],topic_id=q['topic_id'],topic_title=title,stem=payload['stem'],options=[{'letter':o['letter'],'text':o['text']} for o in payload['options']],origin=q['origin'],source_note=q['source_note'],kind=q['kind'],is_retest=retest)
+        result=dict(id=q['id'],topic_id=q['topic_id'],topic_title=title,stem=payload['stem'],options=[{'letter':o['letter'],'text':o['text']} for o in payload['options']],origin=q['origin'],source_note=q['source_note'],kind=q['kind'],is_retest=retest)
+        if is_variant:
+            result['target_label']=conn.execute('SELECT label FROM misconceptions WHERE id=?',(q['target_misconception_id'],)).fetchone()[0]
+        return result
 
     def result_for(conn,q,attempt,duplicate=False):
         p=json.loads(q['payload'])
@@ -252,11 +269,27 @@ def create_app(data_dir=None):
             evidence=await ai.build_evidence(doc_id,search_topic,chunks,sentences,required_ids=required)
             if not evidence['sentences']: raise RuntimeError('证据包为空，依据不足')
             with connect(db_path) as conn: conn.execute('UPDATE topics SET evidence_chunk_ids=? WHERE id=?',(dumps(evidence['chunk_ids']),topic['id']))
+            if any(m['source'] != ai.misconception_review_source for m in misconceptions):
+                # Old live databases retain their IDs/history, but must pass the current
+                # semantic gate before generating more questions under the new version.
+                # Include every stored correction, not only the requested variant target.
+                legacy_required=[sid for m in misconceptions for sid in m['refute_sentence_ids']]
+                evidence=await ai.build_evidence(doc_id,topic,chunks,sentences,required_ids=legacy_required)
+                verified=await ai.verify_misconceptions(doc_id,topic,evidence,misconceptions)
+                if len(verified)!=len(misconceptions):
+                    raise RuntimeError('既有误区未全部通过当前版本原文复核，请重新导入资料；旧记录未改标为已复核')
+                misconceptions=verified
+                with connect(db_path) as conn:
+                    conn.execute('UPDATE topics SET evidence_chunk_ids=? WHERE id=?',(dumps(evidence['chunk_ids']),topic['id']))
+                    for m in misconceptions:
+                        conn.execute('UPDATE misconceptions SET source=? WHERE id=?',(m['source'],m['id']))
             if not misconceptions:
                 misconceptions=await ai.misconceptions(doc_id,topic,evidence)
+                if len(misconceptions)<3:
+                    raise RuntimeError('有原文支持的误区不足 3 条')
                 with connect(db_path) as conn:
                     for m in misconceptions:
-                        conn.execute('INSERT INTO misconceptions VALUES (?,?,?,?,?,?)',(m['id'],topic['id'],m['label'],m['description'],dumps(m['refute_sentence_ids']),'model'))
+                        conn.execute('INSERT INTO misconceptions VALUES (?,?,?,?,?,?)',(m['id'],topic['id'],m['label'],m['description'],dumps(m['refute_sentence_ids']),m.get('source','model')))
             if len(misconceptions)<3: raise RuntimeError('有原文支持的误区不足 3 条')
             new_questions=[]
             for m in misconceptions:
@@ -310,7 +343,7 @@ def create_app(data_dir=None):
             if not questions: raise RuntimeError('暂时无法生成合格的新题，请先回看原文')
             with connect(db_path) as conn:
                 q=questions[0]; quiz_id=save_quiz(conn,sid,doc_id,[q])
-                result=dict(quiz_id=quiz_id,question=public_question(conn,q))
+                result=dict(quiz_id=quiz_id,question=public_question(conn,q,is_variant=True))
                 conn.execute("UPDATE jobs SET status='completed',progress=100,result=? WHERE id=?",(dumps(result),jid))
         except asyncio.CancelledError: raise
         except Exception as exc: job_update(jid,'failed',error=safe_error(exc))
@@ -344,6 +377,34 @@ def create_app(data_dir=None):
             metadata=conn.execute('SELECT warnings FROM extraction_metadata WHERE document_id=?',(doc_id,)).fetchone()
             return {**result,'topics':topics,'samples':[dict(r) for r in conn.execute('SELECT page_index,text FROM pages WHERE document_id=? ORDER BY page_index LIMIT 3',(doc_id,))],'jobs':[dict(r) for r in conn.execute('SELECT id,status,progress,error FROM jobs WHERE document_id=? ORDER BY created_at DESC LIMIT 5',(doc_id,))],'candidate_topics':json.loads(d['candidate_topics']),'error':d['error'],'warnings':json.loads(metadata[0]) if metadata else []}
 
+    @app.get('/api/documents/{doc_id}/ai')
+    def ai_overview(doc_id:str,request:Request):
+        from backend.ai.client import LLMClient, PROMPT_VERSION
+        with connect(db_path) as conn:
+            document=doc_owned(conn,doc_id,request.state.session_id)
+            client=LLMClient()
+            counts={table:conn.execute(f'SELECT COUNT(*) FROM {table} WHERE document_id=?',(doc_id,)).fetchone()[0]
+                    for table in ('pages','sentences','chunks','questions')}
+            chunks=[dict(id=row['id'],page_index=row['page_index'],text=row['text'],sentence_count=len(json.loads(row['sentence_ids'])))
+                    for row in conn.execute('SELECT * FROM chunks WHERE document_id=? ORDER BY page_index LIMIT 8',(doc_id,))]
+            misconceptions=[]
+            for row in conn.execute('SELECT m.* FROM misconceptions m JOIN topics t ON m.topic_id=t.id WHERE t.document_id=? ORDER BY m.rowid',(doc_id,)):
+                refs=json.loads(row['refute_sentence_ids'])
+                text=''.join(conn.execute('SELECT text FROM sentences WHERE id=? AND document_id=?',(sid,doc_id)).fetchone()[0] for sid in refs)
+                misconceptions.append(dict(id=row['id'],label=row['label'],refutation=text))
+            call_summary=conn.execute('SELECT COUNT(*) AS total,COALESCE(SUM(input_tokens+output_tokens),0) AS tokens,COALESCE(AVG(latency_ms),0) AS average_ms FROM llm_calls WHERE document_id=?',(doc_id,)).fetchone()
+            records=[dict(row) for row in conn.execute('SELECT id,purpose,model,input_tokens,output_tokens,status FROM llm_calls WHERE document_id=? ORDER BY created_at DESC LIMIT 20',(doc_id,))]
+            stats=[json.loads(row[0]) for row in conn.execute('SELECT stats FROM generation_runs WHERE document_id=?',(doc_id,))]
+            return dict(is_demo=bool(document['is_demo']),prompt_version=PROMPT_VERSION,
+                        models=[dict(role='生成模型',name=client.model,configured=bool(client.api_key)),
+                                dict(role='复核模型',name=client.review_model,configured=bool(client.review_key)),
+                                dict(role='向量模型',name=client.embed_model,configured=bool(client.embed_key))],
+                        counts=counts,chunks=chunks,misconceptions=misconceptions,
+                        generation=dict(accepted=sum(s.get('accepted',0) for s in stats),
+                                        rejected=sum(s.get('code_rejected',0)+s.get('review_rejected',0) for s in stats),
+                                        repairs=sum(s.get('repair_attempted',0) for s in stats)),
+                        calls={**dict(call_summary),'records':records})
+
     @app.post('/api/documents',status_code=202)
     async def upload(request:Request,file:UploadFile=File(...)):
         if not uploads: raise HTTPException(403,'当前模式未开放上传；请配置模型凭证并开启上传')
@@ -352,17 +413,25 @@ def create_app(data_dir=None):
         if len(content)>10*1024*1024: raise HTTPException(413,'PDF 不能超过 10 MB')
         if not content.startswith(b'%PDF-'): raise HTTPException(400,'文件不是有效的 PDF')
         sha=hashlib.sha256(content).hexdigest(); sid=request.state.session_id
-        with connect(db_path) as conn:
-            existing=conn.execute('SELECT * FROM documents WHERE sha256=? AND session_id=?',(sha,sid)).fetchone()
-            if existing: return doc_summary(conn,existing)
-            recent=conn.execute("SELECT COUNT(*) FROM jobs WHERE session_id=? AND created_at>?",(sid,datetime.fromtimestamp(datetime.now(timezone.utc).timestamp()-60,timezone.utc).isoformat())).fetchone()[0]
-            if recent>=5: raise HTTPException(429,'操作过于频繁，请一分钟后再试')
-            doc_id=uid('doc')
-            name=Path((file.filename or '未命名.pdf').replace('\\','/')).name[:200]
-            conn.execute('INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?,?)',(doc_id,sid,0,name,sha,'parsing',0,'用户上传 · 等待模型质检','[]',None,now()))
-            jid=new_job(conn,doc_id,sid,'ingest')
-        folder=data_dir/'uploads'; folder.mkdir(exist_ok=True)
-        (folder/(doc_id+'.pdf')).write_bytes(content)
+        stored_path = None
+        try:
+            with connect(db_path) as conn:
+                existing=conn.execute('SELECT * FROM documents WHERE sha256=? AND session_id=?',(sha,sid)).fetchone()
+                if existing: return doc_summary(conn,existing)
+                recent=conn.execute("SELECT COUNT(*) FROM jobs WHERE session_id=? AND created_at>?",(sid,datetime.fromtimestamp(datetime.now(timezone.utc).timestamp()-60,timezone.utc).isoformat())).fetchone()[0]
+                if recent>=5: raise HTTPException(429,'操作过于频繁，请一分钟后再试')
+                doc_id=uid('doc')
+                stored_path=store_upload(data_dir/'uploads',doc_id,content)
+                name=Path((file.filename or '未命名.pdf').replace('\\','/')).name[:200]
+                conn.execute('INSERT INTO documents VALUES (?,?,?,?,?,?,?,?,?,?,?)',(doc_id,sid,0,name,sha,'parsing',0,'用户上传 · 等待模型质检','[]',None,now()))
+                jid=new_job(conn,doc_id,sid,'ingest')
+        except Exception as exc:
+            if stored_path is not None:
+                with suppress(OSError):
+                    stored_path.unlink(missing_ok=True)
+            if isinstance(exc,OSError):
+                raise HTTPException(503,'资料未能保存，请检查服务器磁盘空间后重试') from exc
+            raise
         start_task(parse_job(jid,doc_id))
         return dict(id=doc_id,status='parsing',job_id=jid)
 
@@ -431,9 +500,10 @@ def create_app(data_dir=None):
     def quiz(quiz_id:str,request:Request):
         with connect(db_path) as conn:
             quiz=quiz_owned(conn,quiz_id,request.state.session_id); result=[]
-            for qid in json.loads(quiz['question_ids']):
+            question_ids=json.loads(quiz['question_ids'])
+            for qid in question_ids:
                 q=owned_question(conn,qid,request.state.session_id)
-                public=public_question(conn,q,qid in json.loads(quiz['retest_ids']))
+                public=public_question(conn,q,qid in json.loads(quiz['retest_ids']),is_variant=len(question_ids)==1)
                 a=conn.execute('SELECT * FROM attempts WHERE session_id=? AND question_id=?',(request.state.session_id,qid)).fetchone()
                 if a: public['result']=result_for(conn,q,a)
                 result.append(public)
@@ -469,7 +539,7 @@ def create_app(data_dir=None):
             candidates=[q for q in candidates if stem_similarity(json.loads(q['payload'])['stem'],json.loads(original['payload'])['stem'])<=0.6]
             if candidates:
                 q=secrets.choice(candidates); quiz_id=save_quiz(conn,sid,original['document_id'],[q])
-                return dict(quiz_id=quiz_id,question=public_question(conn,q))
+                return dict(quiz_id=quiz_id,question=public_question(conn,q,is_variant=True))
             is_demo=conn.execute('SELECT is_demo FROM documents WHERE id=?',(original['document_id'],)).fetchone()[0]
             if not live or is_demo: raise HTTPException(409,'当前误区库存已练完，暂时无法提供新题，请回看原文')
             guard_active(conn,original['document_id'])
@@ -497,7 +567,7 @@ def create_app(data_dir=None):
             return FileResponse(dist/'favicon.svg',media_type='image/svg+xml')
         @app.get('/{path:path}')
         def spa(path:str):
-            if path.startswith('api/'): raise HTTPException(404,'接口不存在')
+            if path=='api' or path.startswith('api/'): raise HTTPException(404,'接口不存在')
             return FileResponse(dist/'index.html')
     return app
 

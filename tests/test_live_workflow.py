@@ -107,3 +107,87 @@ def test_restarted_jobs_become_interrupted(tmp_path, monkeypatch):
         with connect(app.state.db_path) as db:
             assert db.execute("SELECT status FROM jobs WHERE id='interrupted-job'").fetchone()[0]=='interrupted'
             assert db.execute("SELECT status FROM documents WHERE id='owned'").fetchone()[0]=='interrupted'
+
+
+def test_upload_disk_failure_does_not_leave_queued_document(tmp_path, monkeypatch):
+    monkeypatch.setenv('LLM_API_KEY', 'test-only-never-sent')
+    monkeypatch.setenv('UPLOAD_ENABLED', 'true')
+    import backend.main as main
+
+    def fail_storage(*args):
+        raise OSError('simulated disk full')
+
+    monkeypatch.setattr(main, 'store_upload', fail_storage)
+    app = main.create_app(tmp_path / 'data')
+    with TestClient(app) as client:
+        response = client.post('/api/documents', files={'file': ('notes.pdf', b'%PDF-test', 'application/pdf')})
+        assert response.status_code == 503
+        assert 'simulated' not in response.text
+        with sqlite3.connect(app.state.db_path) as db:
+            assert db.execute('SELECT count(*) FROM documents WHERE is_demo=0').fetchone()[0] == 0
+            assert db.execute('SELECT count(*) FROM jobs').fetchone()[0] == 0
+
+
+def test_short_misconception_batch_can_be_retried_without_poisoning_state(tmp_path, monkeypatch):
+    monkeypatch.setenv('LLM_API_KEY', 'test-only-never-sent')
+    monkeypatch.setenv('UPLOAD_ENABLED', 'true')
+    import backend.ai as ai
+    from backend.main import create_app
+
+    generations = []
+
+    def parse(path, document_id):
+        sentence = {'id': document_id + '_s', 'document_id': document_id, 'page_index': 1,
+                    'ord': 1, 'text': 'Evidence for the fixture.', 'char_start': 0, 'char_end': 25}
+        chunk = {'id': document_id + '_c', 'document_id': document_id, 'page_index': 1,
+                 'first_sentence_ord': 1, 'last_sentence_ord': 1, 'text': sentence['text'], 'sentence_ids': [sentence['id']]}
+        return {'page_count': 1, 'pages': [{'page_index': 1, 'text': sentence['text']}],
+                'sentences': [sentence], 'chunks': [chunk]}
+
+    class SimulatedProvider:
+        def __init__(self, **kwargs):
+            self.last_generation_stats = {}
+
+        async def candidate_topics(self, document_id, pages):
+            return [{'title': '测试知识点', 'description': '工程回归测试'}]
+
+        async def build_evidence(self, document_id, topic, chunks, sentences, required_ids=None):
+            return {'sentences': sentences, 'chunk_ids': [chunks[0]['id']]}
+
+        async def misconceptions(self, document_id, topic, evidence):
+            generations.append(topic['id'])
+            count = 2 if len(generations) == 1 else 3
+            return [{'id': topic['id'] + f'_m{i}', 'label': f'误区{i}', 'description': '测试误区',
+                     'refute_sentence_ids': [evidence['sentences'][0]['id']]} for i in range(count)]
+
+        async def generate_questions(self, document_id, topic, misconceptions, target_id, evidence, existing_stems, parent_id=None):
+            return [{'target_misconception_id': target_id, 'stem': '受控供应商工程测试 ' + target_id,
+                     'options': [{'letter': x, 'text': '测试选项' + x, 'is_correct': x == 'A',
+                                  'feedback': '测试解释', 'misconception_id': None if x == 'A' else target_id} for x in 'ABCD'],
+                     'answer_letter': 'A', 'explanation': '仅测试持久化', 'evidence_sentence_ids': [evidence['sentences'][0]['id']]}]
+
+    monkeypatch.setattr(ai, 'parse_pdf', parse)
+    monkeypatch.setattr(ai, 'AIService', SimulatedProvider)
+    app = create_app(tmp_path / 'data')
+    with TestClient(app) as client:
+        upload = client.post('/api/documents', files={'file': ('notes.pdf', b'%PDF-test', 'application/pdf')}).json()
+        assert wait_job(client, upload['job_id'])['status'] == 'completed'
+        confirmed = client.put(f"/api/documents/{upload['id']}/topics", json={'topics': [{'title': '测试知识点'}]}).json()
+        assert wait_job(client, confirmed['job_id'])['status'] == 'failed'
+        with sqlite3.connect(app.state.db_path) as db:
+            assert db.execute('SELECT count(*) FROM misconceptions m JOIN topics t ON t.id=m.topic_id WHERE t.document_id=?', (upload['id'],)).fetchone()[0] == 0
+        resumed = client.post(f"/api/documents/{upload['id']}/resume").json()
+        assert wait_job(client, resumed['job_id'])['status'] == 'completed'
+        assert client.get('/api/documents/' + upload['id']).json()['status'] == 'ready'
+        assert len(generations) == 2
+
+
+def test_seed_export_cannot_overwrite_its_live_database(tmp_path, monkeypatch):
+    monkeypatch.setenv('LLM_API_KEY', '')
+    from backend.main import create_app
+    app = create_app(tmp_path / 'data')
+    original = app.state.db_path.read_bytes()
+    result = subprocess.run([sys.executable, 'scripts/build_seed.py', '--source-db', str(app.state.db_path),
+                             '--document-id', 'demo', '--output', str(app.state.db_path), '--force'], capture_output=True)
+    assert result.returncode != 0
+    assert app.state.db_path.read_bytes() == original

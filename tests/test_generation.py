@@ -7,6 +7,8 @@ import httpx
 import pytest
 
 from backend.ai import AIService
+from backend.ai.client import LLMClient, ModelError
+from backend.ai.service import MisconceptionReview, Review
 
 
 @pytest.fixture
@@ -22,7 +24,7 @@ def material():
         "evidence_sentence_ids": ["s1"], "explanation": "依据栈后进先出规则，最近的记录应先取出。",
     }
     topic = {"id": "topic", "title": "栈", "description": "操作顺序"}
-    misconceptions = [{"id": mid, "topic_id": "topic"} for mid in ("m1", "m2", "m3")]
+    misconceptions = [{"id": mid, "topic_id": "topic", "source": AIService.misconception_review_source} for mid in ("m1", "m2", "m3")]
     evidence = {"sentences": [{"id": "s1", "document_id": "doc", "text": "栈后进先出，操作发生在栈顶。"}]}
     return question, topic, misconceptions, evidence
 
@@ -35,7 +37,10 @@ def invoke(service, material):
 def reviewed(data, question, **overrides):
     right_text = next(o["text"] for o in question["options"] if o["is_correct"])
     answer = next(o["letter"] for o in data["options"] if o["text"] == right_text)
-    return {"answer_letter": answer, "evidence_sufficient": True, "other_defensible": [], "issues": [], **overrides}
+    by_text = {o["text"]: None if o["is_correct"] else o["misconception_id"] for o in question["options"]}
+    mapping = {o["letter"]: by_text[o["text"]] for o in data["options"]}
+    return {"answer_letter": answer, "evidence_sufficient": True, "other_defensible": [], "issues": [],
+            "option_misconception_ids": mapping, **overrides}
 
 
 def test_blind_review_http_request_never_sends_answer_or_feedback(tmp_path, monkeypatch, material):
@@ -48,8 +53,10 @@ def test_blind_review_http_request_never_sends_answer_or_feedback(tmp_path, monk
         data = json.loads(body["messages"][1]["content"])
         if body["temperature"] == 0:
             reviews.append(data)
-            assert set(data) == {"stem", "options", "sentences"}
+            assert set(data) == {"stem", "options", "sentences", "misconceptions"}
             assert all(set(option) == {"letter", "text"} for option in data["options"])
+            assert all(set(m) == {"id", "label", "description"} for m in data["misconceptions"])
+            assert "target_misconception_id" not in json.dumps(data)
             output = reviewed(data, question)
         else:
             output = {"insufficient": False, "questions": [question]}
@@ -67,6 +74,7 @@ def test_blind_review_http_request_never_sends_answer_or_feedback(tmp_path, monk
 
 @pytest.mark.parametrize("review_problem", [
     {"other_defensible": ["B"]}, {"evidence_sufficient": False}, {"issues": ["题干含糊"]}, {"answer_letter": "?"},
+    {"option_misconception_ids": {"A": None, "B": "foreign", "C": "m2", "D": "m3"}},
 ])
 def test_failed_blind_review_repaired_at_most_once(tmp_path, material, review_problem):
     question, *_ = material
@@ -76,7 +84,7 @@ def test_failed_blind_review_repaired_at_most_once(tmp_path, material, review_pr
     async def chat(document, purpose, system, data, **kwargs):
         calls.append(purpose)
         if purpose == "blind_review":
-            return reviewed(data, question, **review_problem)
+            return Review(**reviewed(data, question, **review_problem))
         return {"questions": [question]}
 
     service.client.chat = chat
@@ -96,7 +104,7 @@ def test_invalid_reference_can_be_repaired_then_blind_reviewed(tmp_path, materia
     async def chat(document, purpose, system, data, **kwargs):
         calls.append(purpose)
         if purpose == "blind_review":
-            return reviewed(data, question)
+            return Review(**reviewed(data, question))
         if purpose == "repair":
             assert data["repair_feedback"] and data["candidate"] == broken
             return {"questions": [question]}
@@ -196,7 +204,10 @@ def test_misconception_ids_stable_and_foreign_refutations_dropped(tmp_path):
     raw = [{"label": label, "description": "待纠正认识", "refute_sentence_ids": ["s1"]} for label in ("先进先出", "任意位置出栈", "整栈删除")]
     raw.append({"label": "跨资料引用", "description": "错误引用", "refute_sentence_ids": ["foreign"]})
 
-    async def chat(*args, **kwargs):
+    async def chat(document, purpose, system, data, **kwargs):
+        if purpose == "review_misconceptions":
+            assert kwargs["review"] is True
+            return MisconceptionReview(topic_supported=True, judgments=[{"id": m["id"], "refuted_by_evidence": True, "reason": "模拟证据核对"} for m in data["misconceptions"]])
         return {"misconceptions": raw}
 
     service.client.chat = chat
@@ -208,3 +219,168 @@ def test_misconception_ids_stable_and_foreign_refutations_dropped(tmp_path):
     assert all(m["topic_id"] == "topic" and m["refute_sentence_ids"] == ["s1"] for m in first)
     raw.pop(0)
     assert asyncio.run(service.misconceptions("doc", topic, evidence)) == []
+
+
+@pytest.mark.parametrize("topic_supported,refutation_supported", [(False, True), (True, False)])
+def test_irrelevant_topic_or_non_refuting_quotes_not_accepted(tmp_path, topic_supported, refutation_supported):
+    service = AIService(cache_dir=tmp_path)
+    raw = [{"label": f"误区{i}", "description": f"待验证的错误认识{i}", "refute_sentence_ids": ["s1"]} for i in range(3)]
+    calls = []
+
+    async def chat(document, purpose, system, data, **kwargs):
+        calls.append(purpose)
+        if purpose == "misconceptions":
+            return {"misconceptions": raw}
+        return MisconceptionReview(topic_supported=topic_supported, judgments=[
+            {"id": m["id"], "refuted_by_evidence": refutation_supported, "reason": "模拟复核：原句不足以推翻该认识"}
+            for m in data["misconceptions"]])
+
+    service.client.chat = chat
+    operation = service.misconceptions("doc", {"id": "topic", "title": "量子力学"},
+                                       {"sentences": [{"id": "s1", "document_id": "doc", "text": "栈是后进先出。"}]})
+    if not topic_supported:
+        with pytest.raises(ModelError) as failure:
+            asyncio.run(operation)
+        assert failure.value.kind == "insufficient_topic_evidence"
+    else:
+        assert asyncio.run(operation) == []
+    assert calls == ["misconceptions", "review_misconceptions"]
+    assert service.last_misconception_stats["review_rejected"] == 3
+    assert service.last_misconception_stats["accepted"] == 0
+
+
+@pytest.mark.parametrize("bad_ids", ["missing", "duplicate", "foreign"])
+def test_semantic_review_cannot_omit_duplicate_or_invent_misconceptions(tmp_path, bad_ids):
+    service = AIService(cache_dir=tmp_path)
+
+    async def chat(document, purpose, system, data, **kwargs):
+        if purpose == "misconceptions":
+            return {"misconceptions": [{"label": f"误区{i}", "description": "错误认识", "refute_sentence_ids": ["s1"]} for i in range(3)]}
+        ids = [m["id"] for m in data["misconceptions"]]
+        if bad_ids == "missing": ids.pop()
+        elif bad_ids == "duplicate": ids[-1] = ids[0]
+        else: ids[-1] = "not-provided"
+        return MisconceptionReview(topic_supported=True, judgments=[{"id": mid, "refuted_by_evidence": True, "reason": "模拟复核"} for mid in ids])
+
+    service.client.chat = chat
+    with pytest.raises(ModelError, match="逐条覆盖"):
+        asyncio.run(service.misconceptions("doc", {"id": "topic", "title": "栈"},
+                                          {"sentences": [{"id": "s1", "document_id": "doc", "text": "栈是后进先出。"}]}))
+
+
+def test_required_correction_must_exist_and_have_a_chunk(tmp_path):
+    service = AIService(cache_dir=tmp_path)
+    sentences = [{"id": "s1", "document_id": "doc", "page_index": 1, "ord": 0, "text": "栈后进先出。"},
+                 {"id": "s2", "document_id": "doc", "page_index": 2, "ord": 1, "text": "只在栈顶操作。"}]
+    chunks = [{"id": "c1", "document_id": "doc", "page_index": 1, "first_sentence_ord": 0,
+               "last_sentence_ord": 0, "text": "栈后进先出。", "sentence_ids": ["s1"]}]
+
+    async def embeddings(doc, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+    service.client.embeddings = embeddings
+    for required in (["foreign"], ["s2"]):
+        with pytest.raises(ModelError) as error:
+            asyncio.run(service.build_evidence("doc", {"id": "t", "title": "栈"}, chunks, sentences, required_ids=required))
+        assert error.value.kind == "missing_refutation"
+
+
+def test_review_structure_failure_is_logged_as_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test-only-key")
+    calls = []
+    invalid = {"answer_letter": "A", "evidence_sufficient": "true", "other_defensible": [], "issues": []}
+    client = LLMClient(logger=calls.append, transport=httpx.MockTransport(lambda request: httpx.Response(
+        200, json={"choices": [{"message": {"content": json.dumps(invalid)}}], "usage": {"prompt_tokens": 3}})))
+    with pytest.raises(ModelError) as error:
+        asyncio.run(client.chat("doc", "blind_review", "system", {}, review=True, output_schema=Review))
+    assert error.value.kind == "invalid_schema"
+    assert calls[0]["status"] == "failed" and calls[0]["error_type"] == "invalid_schema"
+    assert calls[0]["input_tokens"] == 3
+
+
+def test_cancelled_provider_call_has_interrupted_log(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "test-only-key")
+    calls = []
+
+    async def cancelled(request):
+        raise asyncio.CancelledError()
+
+    client = LLMClient(logger=calls.append, transport=httpx.MockTransport(cancelled))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(client.chat("doc", "test", "system", {}))
+    assert len(calls) == 1 and calls[0]["status"] == "interrupted" and calls[0]["error_type"] == "cancelled"
+
+
+def test_wrong_option_binding_is_repaired_then_independently_rechecked(tmp_path, material):
+    question, *_ = material
+    broken = copy.deepcopy(question)
+    broken["options"][1]["misconception_id"], broken["options"][2]["misconception_id"] = "m2", "m1"
+    service, calls = AIService(cache_dir=tmp_path), []
+
+    async def chat(document, purpose, system, data, **kwargs):
+        calls.append(purpose)
+        if purpose == "blind_review":
+            return Review(**reviewed(data, question))  # Independent mapping reflects the option text.
+        if purpose == "repair":
+            assert any("误区归属" in issue for issue in data["repair_feedback"])
+            return {"questions": [question]}
+        return {"questions": [broken]}
+
+    service.client.chat = chat
+    result = invoke(service, material)
+    assert len(result) == 1 and result[0]["target_misconception_id"] == "m1"
+    assert calls == ["generate", "blind_review", "repair", "blind_review"]
+    assert service.last_generation_stats["review_rejected"] == 1
+
+
+def test_repair_cannot_switch_the_target_misconception(tmp_path, material):
+    question, *_ = material
+    swapped = copy.deepcopy(question)
+    swapped["target_misconception_id"] = "m2"
+    service, calls = AIService(cache_dir=tmp_path), []
+
+    async def chat(document, purpose, system, data, **kwargs):
+        calls.append(purpose)
+        if purpose == "blind_review":
+            return Review(**reviewed(data, question, evidence_sufficient=False))
+        return {"questions": [swapped if purpose == "repair" else question]}
+
+    service.client.chat = chat
+    assert invoke(service, material) == []
+    assert calls == ["generate", "blind_review", "repair"]
+    assert service.last_generation_stats["code_rejected"] == 1
+
+
+def test_later_model_failure_does_not_count_undelivered_batch_as_accepted(tmp_path, material):
+    question, *_ = material
+    second = copy.deepcopy(question)
+    second["stem"] = "货架模拟器只允许从容器顶端移出物件，删除操作遵循哪项规则？"
+    service, reviews = AIService(cache_dir=tmp_path), []
+
+    async def chat(document, purpose, system, data, **kwargs):
+        if purpose == "generate":
+            return {"questions": [question, second]}
+        if purpose == "blind_review":
+            reviews.append(data)
+            if len(reviews) == 2:
+                raise ModelError("timeout", "模拟超时")
+            return Review(**reviewed(data, question))
+        raise AssertionError("Network failure should not become a repair loop")
+
+    service.client.chat = chat
+    with pytest.raises(ModelError, match="模拟超时"):
+        invoke(service, material)
+    assert service.last_generation_stats["accepted"] == 0
+    assert service.last_generation_stats["validated_unpublished"] == 1
+
+
+def test_old_semantic_version_cannot_generate_without_recheck(tmp_path, material):
+    _, _, misconceptions, _ = material
+    misconceptions[0]["source"] = "model"
+    service = AIService(cache_dir=tmp_path)
+
+    async def never(*args, **kwargs):
+        raise AssertionError("Old semantic claims must be reviewed before generating")
+
+    service.client.chat = never
+    assert invoke(service, material) == []

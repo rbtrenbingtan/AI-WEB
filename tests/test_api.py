@@ -53,9 +53,11 @@ def test_quiz_hides_answers_and_requires_confidence(client):
     _, quiz = make_quiz(client)
     assert len(quiz['questions']) == 3
     assert len({q['id'] for q in quiz['questions']}) == 3
-    forbidden = ('answer_letter', 'is_correct', 'explanation', 'evidence_sentence_ids', 'target_misconception_id', 'feedback')
+    forbidden = ('answer_letter', 'is_correct', 'explanation', 'evidence_sentence_ids', 'target_misconception_id', 'target_label', 'feedback')
     encoded = json.dumps(quiz)
     assert all(key not in encoded for key in forbidden)
+    restored = json.dumps(client.get(f"/api/quizzes/{quiz['id']}").json())
+    assert all(key not in restored for key in forbidden)
     q = quiz['questions'][0]
     assert {o['letter'] for o in q['options']} == set('ABCD')
     r = client.post(f"/api/questions/{q['id']}/attempts", json={'quiz_id': quiz['id'], 'selected': 'A'})
@@ -110,6 +112,9 @@ def test_wrong_answer_evidence_variant_and_retest(client, app):
     body = variant.json()
     newq = body['question']
     assert newq['id'] != q['id']
+    assert newq['target_label'] == result['misconception']['label']
+    restored = client.get(f"/api/quizzes/{body['quiz_id']}").json()['questions'][0]
+    assert restored['target_label'] == newq['target_label']
     iq = internal_question(app, newq['id'])
     assert iq['target_misconception_id'] == mid
     r = submit(client, {'id': body['quiz_id']}, newq, iq['answer_letter'])
@@ -160,3 +165,50 @@ def test_cross_origin_submission_rejected(client):
     doc,quiz=make_quiz(client)
     result=client.post('/api/quizzes',json={'document_id':doc['id'],'topic_ids':[doc['topics'][0]['id']]},headers={'origin':'https://unrelated.example'})
     assert result.status_code==403
+
+
+def test_upload_atomic_write_removes_partial_file_on_failure(tmp_path, monkeypatch):
+    from pathlib import Path
+    from backend.main import store_upload
+    original_write = Path.write_bytes
+
+    def interrupted_write(path, content):
+        original_write(path, content[:3])
+        raise OSError('interrupted write')
+
+    monkeypatch.setattr(Path, 'write_bytes', interrupted_write)
+    with pytest.raises(OSError):
+        store_upload(tmp_path, 'owned', b'%PDF-test-content')
+    assert not (tmp_path / 'owned.part').exists()
+    assert not (tmp_path / 'owned.pdf').exists()
+
+
+def test_ai_workbench_uses_stored_facts_without_exposing_credentials(client, monkeypatch):
+    monkeypatch.setenv('REVIEW_API_KEY', 'test-private-value-not-for-display')
+    response = client.get('/api/documents/demo/ai')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['is_demo'] is True
+    assert body['counts']['questions'] == 48
+    assert body['counts']['pages'] == 8
+    assert body['calls'] == {'total': 0, 'tokens': 0, 'average_ms': 0, 'records': []}
+    assert body['generation'] == {'accepted': 0, 'rejected': 0, 'repairs': 0}
+    assert body['misconceptions'][0]['refutation']
+    assert 'test-private-value-not-for-display' not in response.text
+    assert 'answer_letter' not in response.text
+
+
+def test_ai_workbench_cannot_read_another_session_document(client, app):
+    with sqlite3.connect(app.state.db_path) as db:
+        db.execute("INSERT INTO documents(id,session_id,is_demo,name,sha256,status,created_at) VALUES('private','other',0,'私有讲义','hash','ready','2026-11-16')")
+    assert client.get('/api/documents/private/ai').status_code == 404
+
+
+def test_seed_evidence_stays_sentence_level_after_misconception_merge(app):
+    with sqlite3.connect(app.state.db_path) as db:
+        for payload, refs in db.execute('SELECT q.payload,m.refute_sentence_ids FROM questions q JOIN misconceptions m ON q.target_misconception_id=m.id'):
+            evidence = json.loads(payload)['evidence_sentence_ids']
+            assert 1 <= len(evidence) <= 2
+            assert len(set(evidence + json.loads(refs))) <= 3
+            for sid in evidence:
+                assert not sid.endswith('_s00')

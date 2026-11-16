@@ -1,41 +1,420 @@
-import {useEffect,useRef,useState} from 'react';
-import {ArrowRight,BookOpen,Check,CheckCircle2,ChevronDown,Clock3,FileText,Layers3,Loader2,Plus,RefreshCw,ShieldCheck,Sparkles,Target,UploadCloud,X} from 'lucide-react';
-import type {Candidate,DocumentSummary,Health,StudyDocument} from './types';
+import { useEffect, useRef, useState } from "react";
+import {
+  ArrowRight,
+  BookOpen,
+  Check,
+  ChevronDown,
+  FileText,
+  Loader2,
+  Plus,
+  RefreshCw,
+  UploadCloud,
+  X,
+} from "lucide-react";
+import type {
+  Candidate,
+  DocumentSummary,
+  Health,
+  StudyDocument,
+} from "./types";
 
-const labels:Record<string,string>={ready:'可练习',parsing:'解析中',indexing:'建立索引',generating:'生成题库',processing:'处理中',pending:'等待处理',queued:'已排队',running:'处理中',failed:'处理失败',interrupted:'已中断',awaiting_topics:'待确认知识点',needs_confirmation:'待确认知识点',awaiting_confirmation:'待确认知识点',insufficient:'依据不足',draft:'待确认'};
-export function statusLabel(status:string){return labels[status]||status;}
-interface Props {documents:DocumentSummary[];document:StudyDocument|null;selectedId:string;selectedTopics:string[];health:Health|null;busy:string;onSelect:(id:string)=>void;onTopics:(ids:string[])=>void;onStart:()=>void;onUpload:(file:File)=>void;onConfirmTopics:(topics:Candidate[])=>void;onResume:()=>void;onRefresh:()=>void}
-
-export function DocumentsPage(p:Props){
- const input=useRef<HTMLInputElement>(null),[expanded,setExpanded]=useState<string[]>([]),[samplesOpen,setSamplesOpen]=useState(false),[dragging,setDragging]=useState(false);
- const doc=p.document,readyTopics=doc?.topics.filter(t=>t.question_count>=3&&t.status==='ready').length||0;
- const toggleTopic=(id:string)=>p.onTopics(p.selectedTopics.includes(id)?p.selectedTopics.filter(x=>x!==id):[...p.selectedTopics,id]);
- const unavailableUpload=!p.health?.upload_enabled;
- const candidateState=doc&&!doc.is_demo&&!doc.topics.length&&doc.samples.length>0&&['awaiting_topics','needs_confirmation','awaiting_confirmation','draft','failed'].includes(doc.status);
- return <>
-  <section className="page-heading"><div><div className="eyebrow"><span/>LEARN WITH EVIDENCE</div><h1>从一份资料，开始真正理解。</h1><p>选定知识点，完成一轮练习。每一个答案，都能回到原文。</p></div><span className="heading-note"><BookOpen size={16}/> 你的知识，值得被认真理解</span></section>
-  <div className="intro-grid"><section className="intro-card"><div className="intro-copy"><span className="pill light"><Sparkles size={13}/> 以证据为起点的学习</span><h2>不止知道答案，<br/>更知道<span>为什么。</span></h2><p>找到自己的误区，用课程原文厘清，<br/>再用一道新题，验证理解。</p><div className="intro-steps"><span><i>1</i>选择资料</span><b>→</b><span><i>2</i>完成小测</span><b>→</b><span><i>3</i>循证纠错</span></div></div><div className="evidence-art" aria-hidden="true"><div className="art-orbit"/><div className="art-paper back"/><div className="art-paper"><div className="art-kicker">COURSE NOTES<span>01</span></div><div className="art-title">每一份理解<br/>都留下证据</div><div className="art-line"/><div className="art-line short"/><div className="art-highlight"><Check size={16}/> 让原文回答「为什么」</div><div className="art-line"/><div className="art-line medium"/><div className="art-footer"><span>知证学伴</span><BookOpen size={19}/></div></div><div className="art-stamp"><ShieldCheck size={23}/><span>原文可查</span></div></div></section><aside className="how-card"><span className="eyebrow">一个小小的学习闭环</span><h3>把「我以为」<br/>变成「我理解」。</h3><div className="journey"><div><i><Target size={15}/></i><p>作答 + 标注信心<small>看见答案背后的判断</small></p></div><div><i><BookOpen size={15}/></i><p>找到原文证据<small>定位可能存在的误区</small></p></div><div><i><RefreshCw size={15}/></i><p>同一误区，再练一次<small>用新情境检验理解</small></p></div></div></aside></div>
-  <section className="section-heading"><div><h2>我的资料 <span className="count-badge">{p.documents.length.toString().padStart(2,'0')}</span></h2><p>内置示例可直接练习；实时模式支持导入自己的课程讲义。</p></div><button className="text-button" onClick={p.onRefresh}><RefreshCw size={15}/>刷新</button></section>
-  <div className="library-grid">{p.documents.map(d=><button key={d.id} onClick={()=>p.onSelect(d.id)} className={`document-card ${p.selectedId===d.id?'selected':''}`} aria-pressed={p.selectedId===d.id}><div className="document-card-top"><span className="document-icon"><FileText size={24}/></span><span className={`pill ${d.status==='ready'?'green':'neutral'}`}><span className="mini-dot"/>{statusLabel(d.status)}</span>{p.selectedId===d.id&&<span className="selected-check"><Check size={13}/></span>}</div><h3>{d.name}</h3><p>{d.is_demo?'内置示例讲义':'我的课程讲义'}</p><div className="document-meta"><span>{d.page_count||'—'} 页</span><span>{d.topic_count||0} 个知识点</span><span>{d.question_count||0} 道题</span></div><div className="document-card-bottom"><span>{d.is_demo?'随时开始 · 无需配置':'仅当前会话可见'}</span><ArrowRight size={16}/></div></button>)}
-   <div className={`upload-card ${unavailableUpload?'disabled':''} ${dragging?'dragging':''}`} onDragOver={e=>{e.preventDefault();if(!unavailableUpload)setDragging(true);}} onDragLeave={()=>setDragging(false)} onDrop={e=>{e.preventDefault();setDragging(false);if(!unavailableUpload&&e.dataTransfer.files[0])p.onUpload(e.dataTransfer.files[0]);}}><input type="file" ref={input} accept=".pdf,application/pdf" aria-label="选择文本型 PDF" onChange={e=>{if(e.target.files?.[0])p.onUpload(e.target.files[0]);e.target.value='';}} hidden/><span className="upload-icon"><UploadCloud size={26}/></span><h3>加入自己的学习资料</h3><p>{unavailableUpload?'演示模式暂不开放上传':'拖放 PDF 到这里，或点击选择文件'}</p><button className="button small secondary" disabled={unavailableUpload||!!p.busy} onClick={()=>input.current?.click()}>{p.busy==='upload'?<Loader2 size={15} className="spin"/>:<Plus size={15}/>}上传 PDF</button><small>{unavailableUpload?'服务端配置模型 Key 后开启':'仅文本型 PDF · 最多 10 MB / 30 页'}</small></div>
-  </div>
-  {doc?<section className="document-detail card"><div className="detail-header"><div><span className="eyebrow">YOUR LEARNING MAP</span><h2>今天，想弄懂哪一部分？</h2><p>{doc.name} <span className="divider-dot">·</span> 选择一个或多个知识点，开始 3 题小测</p></div><div className="coverage-summary"><strong>{readyTopics}<span> / {doc.topics.length}</span></strong><small>知识点已可练习</small></div></div>
-   {doc.jobs?.filter(j=>['pending','queued','running','failed','interrupted'].includes(j.status)).map(j=><div key={j.id} className={`job-panel ${['failed','interrupted'].includes(j.status)?'warning':''}`}><div>{['pending','queued','running'].includes(j.status)?<Loader2 size={17} className="spin"/>:<Clock3 size={17}/>}<strong>{statusLabel(j.status)}</strong><span>{j.error||'正在准备课程证据与题库，完成后会自动更新。'}</span></div>{['pending','queued','running'].includes(j.status)&&<progress max="100" value={Math.max(0,Math.min(100,j.progress<=1?j.progress*100:j.progress))}/>}</div>)}
-   {['interrupted','failed'].includes(doc.status)&&!doc.is_demo&&<button className="button secondary" disabled={!!p.busy} onClick={p.onResume}><RefreshCw size={16}/>继续处理</button>}
-   {doc.warnings?.map((warning,i)=><p className="topic-reason" key={i}>{warning}</p>)}
-   {candidateState&&<CandidateEditor candidates={doc.candidate_topics} busy={p.busy==='topics'} onConfirm={p.onConfirmTopics}/>}
-   <div className="topic-list">{doc.topics.map((t,i)=><div className={`topic-row ${p.selectedTopics.includes(t.id)?'chosen':''}`} key={t.id}><div className="topic-main"><label className="topic-choice"><input type="checkbox" checked={p.selectedTopics.includes(t.id)} onChange={()=>toggleTopic(t.id)} disabled={t.question_count<3||t.status!=='ready'}/><span className="custom-checkbox"><Check size={13}/></span><span className="topic-number">{String(i+1).padStart(2,'0')}</span><span className="topic-text"><strong>{t.title}</strong><small>{t.description||'围绕课程原文，厘清概念与常见误区。'}</small></span></label><div className="topic-side"><span className={`topic-count ${t.question_count<3?'muted':''}`}><Layers3 size={14}/>{t.question_count} 道题</span><button className={`text-button coverage-toggle ${expanded.includes(t.id)?'expanded':''}`} aria-expanded={expanded.includes(t.id)} onClick={()=>setExpanded(v=>v.includes(t.id)?v.filter(x=>x!==t.id):[...v,t.id])}>{t.misconceptions.length} 个误区<ChevronDown size={15}/></button></div></div>{t.reason&&<p className="topic-reason">{t.reason}</p>}{expanded.includes(t.id)&&<div className="coverage-grid">{t.misconceptions.map(m=><div className="misconception-cell" key={m.id}><span className={m.question_count>0?'coverage-dot ready':'coverage-dot'}/><div><strong>{m.label}</strong><p>{m.description}</p></div><span className="coverage-quantity">{m.question_count}<small>题</small></span></div>)}{!t.misconceptions.length&&<p className="muted">正在建立误区与原文的关联。</p>}</div>}</div>)}</div>
-   {!doc.topics.length&&!candidateState&&<div className="empty-inline"><Clock3 size={20}/><p>知识点准备好后会显示在这里。{doc.status==='failed'?'请查看处理状态后重试。':'你可以稍后刷新查看。'}</p></div>}
-   <div className="start-row"><div><span><ShieldCheck size={17}/> 先理解，再检验</span><small>已选 {p.selectedTopics.length} 个知识点 · 每轮 3 题 · 信心需自行标注</small></div><button className="button primary" onClick={p.onStart} disabled={!!p.busy||!p.selectedTopics.length}>{p.busy==='start'?<Loader2 size={17} className="spin"/>:<Target size={17}/>}开始本轮练习<ArrowRight size={17}/></button></div>
-   <div className="provenance"><ShieldCheck size={15}/><span>{doc.source_note||'题目来源以每道题上的说明为准。模型复核也可能出错，请结合原文判断。'}</span></div>
-   {!!doc.samples?.length&&<div className="samples"><button className="text-button" onClick={()=>setSamplesOpen(v=>!v)} aria-expanded={samplesOpen}><FileText size={15}/>查看提取文本样本<ChevronDown size={15}/></button>{samplesOpen&&<div className="sample-grid">{doc.samples.map(s=><article key={s.page_index}><span>物理第 {s.page_index} 页</span><p>{s.text}</p></article>)}</div>}</div>}
-  </section>:p.selectedId?<div className="loading-state card"><Loader2 className="spin"/><p>正在载入资料…</p></div>:<div className="empty-state card"><BookOpen/><h3>还没有可用资料</h3><p>检查服务是否完成初始化，或在实时模式下上传 PDF。</p></div>}
- </>;
+const labels: Record<string, string> = {
+  ready: "可练习",
+  parsing: "解析中",
+  indexing: "建立索引",
+  generating: "生成题库",
+  queued: "已排队",
+  running: "处理中",
+  failed: "处理失败",
+  interrupted: "已中断",
+  awaiting_topics: "待确认知识点",
+  insufficient: "依据不足",
+};
+export function statusLabel(status: string) {
+  return labels[status] ?? status;
+}
+interface Props {
+  documents: DocumentSummary[];
+  document: StudyDocument | null;
+  selectedId: string;
+  selectedTopics: string[];
+  health: Health | null;
+  busy: string;
+  onSelect: (id: string) => void;
+  onTopics: (ids: string[]) => void;
+  onStart: () => void;
+  onUpload: (file: File) => void;
+  onConfirmTopics: (topics: Candidate[]) => void;
+  onResume: () => void;
+  onRefresh: () => void;
+  onQuickStart?: () => void;
+  onAI?: () => void;
 }
 
-function CandidateEditor({candidates,busy,onConfirm}:{candidates:Candidate[];busy:boolean;onConfirm:(items:Candidate[])=>void}){
- const [items,setItems]=useState<(Candidate&{checked:boolean})[]>([]);
- useEffect(()=>setItems(candidates.map(c=>({...c,checked:true}))),[JSON.stringify(candidates)]);
- const valid=items.filter(c=>c.checked&&c.title.trim());
- return <div className="candidate-panel"><h3><Sparkles size={18}/>确认你的知识点</h3><p>已从资料中提取以下候选。可以取消勾选、修改名称，或添加一个知识点。</p>{items.map((item,i)=><div className="candidate-row" key={i}><input aria-label={`使用知识点 ${i+1}`} type="checkbox" checked={item.checked} onChange={e=>setItems(v=>v.map((x,j)=>i===j?{...x,checked:e.target.checked}:x))}/><input aria-label={`知识点 ${i+1} 名称`} value={item.title} maxLength={80} placeholder="知识点名称" onChange={e=>setItems(v=>v.map((x,j)=>i===j?{...x,title:e.target.value}:x))}/><input aria-label={`知识点 ${i+1} 描述`} value={item.description} maxLength={300} placeholder="一句话描述（可选）" onChange={e=>setItems(v=>v.map((x,j)=>i===j?{...x,description:e.target.value}:x))}/><button className="icon-button" aria-label={`移除知识点 ${i+1}`} onClick={()=>setItems(v=>v.filter((_,j)=>j!==i))}><X size={16}/></button></div>)}<div className="candidate-actions"><button className="text-button" disabled={items.length>=6} onClick={()=>setItems(v=>[...v,{title:'',description:'',checked:true}])}><Plus size={15}/>新增知识点</button><button className="button primary small" disabled={busy||!valid.length||valid.length>6} onClick={()=>onConfirm(valid.map(({title,description})=>({title:title.trim(),description:description.trim()})))}>{busy?<Loader2 className="spin" size={15}/>:<CheckCircle2 size={16}/>}确认并生成练习</button></div></div>;
+export function DocumentsPage(p: Props) {
+  const input = useRef<HTMLInputElement>(null);
+  const [expanded, setExpanded] = useState<string[]>([]);
+  const doc = p.document;
+  const candidateState =
+    doc &&
+    !doc.is_demo &&
+    !doc.topics.length &&
+    doc.samples.length > 0 &&
+    ["awaiting_topics", "failed"].includes(doc.status);
+  return (
+    <>
+      <header className="page-heading">
+        <h1>学习资料</h1>
+        <button className="text-button" onClick={p.onRefresh}>
+          <RefreshCw size={18} />
+          刷新
+        </button>
+      </header>
+      <section className="quick-start">
+        <div>
+          <h2>答错时，直接回到讲义原文</h2>
+          <p>选择答案、记录信心，用新的情境检验同一个误区。</p>
+        </div>
+        <button
+          className="button primary"
+          disabled={!!p.busy}
+          onClick={p.onQuickStart ?? p.onStart}
+        >
+          {p.busy === "start" && <Loader2 size={18} className="spin" />}
+          用示例讲义练 3 题<ArrowRight size={18} />
+        </button>
+      </section>
+      <div className="section-heading">
+        <h2>我的资料</h2>
+        {p.onAI && (
+          <button className="text-button" onClick={p.onAI}>
+            查看 AI 工作流
+            <ArrowRight size={18} />
+          </button>
+        )}
+      </div>
+      <div className="library-grid">
+        {p.documents.map((document) => (
+          <button
+            key={document.id}
+            className={`document-card ${document.id === p.selectedId ? "selected" : ""}`}
+            onClick={() => p.onSelect(document.id)}
+            aria-pressed={document.id === p.selectedId}
+          >
+            <span className="document-card-top">
+              <FileText size={28} />
+              <span className="badge">{statusLabel(document.status)}</span>
+            </span>
+            <h3>{document.name}</h3>
+            <span className="document-meta">
+              {document.page_count} 页 · {document.topic_count} 个知识点 ·{" "}
+              {document.question_count} 道题
+            </span>
+          </button>
+        ))}
+        {p.health?.upload_enabled && (
+          <div
+            className="upload-card"
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => {
+              event.preventDefault();
+              if (!p.busy && event.dataTransfer.files[0])
+                p.onUpload(event.dataTransfer.files[0]);
+            }}
+          >
+            <input
+              type="file"
+              ref={input}
+              accept=".pdf,application/pdf"
+              aria-label="选择文本型 PDF"
+              hidden
+              onChange={(event) => {
+                if (event.target.files?.[0]) p.onUpload(event.target.files[0]);
+                event.target.value = "";
+              }}
+            />
+            <UploadCloud size={28} />
+            <h3>导入课程讲义</h3>
+            <p>文本 PDF · 10 MB / 30 页</p>
+            <button
+              className="button secondary"
+              disabled={!!p.busy}
+              onClick={() => input.current?.click()}
+            >
+              {p.busy === "upload" ? (
+                <Loader2 size={18} className="spin" />
+              ) : (
+                <Plus size={18} />
+              )}
+              上传 PDF
+            </button>
+          </div>
+        )}
+      </div>
+      {!doc && (
+        <div className="card empty-state">
+          {p.selectedId ? (
+            <>
+              <Loader2 className="spin" />
+              加载资料…
+            </>
+          ) : (
+            <>
+              <BookOpen />
+              <h3>暂无资料</h3>
+            </>
+          )}
+        </div>
+      )}
+      {doc && (
+        <section className="card document-detail">
+          <header className="section-heading">
+            <h2>选择知识点</h2>
+            <span className="secondary-text">{doc.topics.length} 个知识点</span>
+          </header>
+          {doc.jobs
+            .filter((job) =>
+              ["queued", "running", "failed", "interrupted"].includes(
+                job.status,
+              ),
+            )
+            .map((job) => (
+              <div className="job-panel" key={job.id}>
+                <strong>{statusLabel(job.status)}</strong>
+                {job.error && <p>{job.error}</p>}
+                {["queued", "running"].includes(job.status) && (
+                  <progress max="100" value={job.progress} />
+                )}
+              </div>
+            ))}
+          {["interrupted", "failed"].includes(doc.status) && !doc.is_demo && (
+            <button
+              className="button secondary"
+              disabled={!!p.busy}
+              onClick={p.onResume}
+            >
+              <RefreshCw size={18} />
+              继续处理
+            </button>
+          )}
+          {doc.warnings?.map((warning) => (
+            <p className="text-wrong" key={warning}>
+              {warning}
+            </p>
+          ))}
+          {candidateState && (
+            <CandidateEditor
+              candidates={doc.candidate_topics}
+              busy={p.busy === "topics"}
+              onConfirm={p.onConfirmTopics}
+            />
+          )}
+          <div className="topic-list">
+            {doc.topics.map((topic) => (
+              <div className="topic-row" key={topic.id}>
+                <div className="topic-main">
+                  <label className="topic-choice">
+                    <input
+                      type="checkbox"
+                      checked={p.selectedTopics.includes(topic.id)}
+                      disabled={
+                        topic.question_count < 3 || topic.status !== "ready"
+                      }
+                      onChange={() =>
+                        p.onTopics(
+                          p.selectedTopics.includes(topic.id)
+                            ? p.selectedTopics.filter((id) => id !== topic.id)
+                            : [...p.selectedTopics, topic.id],
+                        )
+                      }
+                    />
+                    <span>{topic.title}</span>
+                  </label>
+                  <span className="secondary-text">
+                    {topic.question_count} 道题
+                  </span>
+                  <button
+                    className="text-button"
+                    aria-expanded={expanded.includes(topic.id)}
+                    onClick={() =>
+                      setExpanded((previous) =>
+                        previous.includes(topic.id)
+                          ? previous.filter((id) => id !== topic.id)
+                          : [...previous, topic.id],
+                      )
+                    }
+                  >
+                    {topic.misconceptions.length} 个误区
+                    <ChevronDown size={18} />
+                  </button>
+                </div>
+                {topic.reason && <p className="text-wrong">{topic.reason}</p>}
+                {expanded.includes(topic.id) && (
+                  <div className="coverage-list">
+                    {topic.misconceptions.map((item) => (
+                      <div key={item.id}>
+                        <span>{item.label}</span>
+                        <span className="badge">{item.question_count} 题</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          <div className="start-row">
+            <span>已选 {p.selectedTopics.length} 个知识点 · 3 题</span>
+            <button
+              className="button primary"
+              disabled={!!p.busy || !p.selectedTopics.length}
+              onClick={p.onStart}
+            >
+              {p.busy === "start" && <Loader2 size={18} className="spin" />}
+              开始本轮练习
+              <ArrowRight size={18} />
+            </button>
+          </div>
+          {doc.samples.length > 0 && (
+            <details className="samples">
+              <summary>查看讲义文本</summary>
+              <div className="sample-grid">
+                {doc.samples.map((sample) => (
+                  <article key={sample.page_index}>
+                    <h3>第 {sample.page_index} 页</h3>
+                    <p>{sample.text}</p>
+                  </article>
+                ))}
+              </div>
+            </details>
+          )}
+        </section>
+      )}
+    </>
+  );
+}
+
+function CandidateEditor({
+  candidates,
+  busy,
+  onConfirm,
+}: {
+  candidates: Candidate[];
+  busy: boolean;
+  onConfirm: (items: Candidate[]) => void;
+}) {
+  const [items, setItems] = useState<(Candidate & { checked: boolean })[]>([]);
+  useEffect(
+    () =>
+      setItems(
+        candidates.length
+          ? candidates.map((candidate) => ({ ...candidate, checked: true }))
+          : [{ title: "", description: "", checked: true }],
+      ),
+    [candidates],
+  );
+  const selected = items.filter((item) => item.checked);
+  const duplicate =
+    new Set(selected.map((item) => item.title.trim().toLocaleLowerCase()))
+      .size !== selected.length;
+  const missing = selected.some((item) => !item.title.trim());
+  return (
+    <section className="candidate-panel">
+      <h3>确认知识点</h3>
+      <p>
+        {candidates.length
+          ? "勾选并修改需要练习的知识点。"
+          : "没有可用候选，请填写知识点名称。"}
+      </p>
+      {items.map((item, index) => (
+        <div className="candidate-row" key={index}>
+          <input
+            type="checkbox"
+            aria-label={`使用知识点 ${index + 1}`}
+            checked={item.checked}
+            onChange={(event) =>
+              setItems((previous) =>
+                previous.map((value, i) =>
+                  index === i
+                    ? { ...value, checked: event.target.checked }
+                    : value,
+                ),
+              )
+            }
+          />
+          <input
+            aria-label={`知识点 ${index + 1} 名称`}
+            value={item.title}
+            maxLength={80}
+            placeholder="知识点名称"
+            onChange={(event) =>
+              setItems((previous) =>
+                previous.map((value, i) =>
+                  index === i ? { ...value, title: event.target.value } : value,
+                ),
+              )
+            }
+          />
+          <input
+            aria-label={`知识点 ${index + 1} 描述`}
+            value={item.description}
+            maxLength={300}
+            placeholder="描述（可选）"
+            onChange={(event) =>
+              setItems((previous) =>
+                previous.map((value, i) =>
+                  index === i
+                    ? { ...value, description: event.target.value }
+                    : value,
+                ),
+              )
+            }
+          />
+          <button
+            className="icon-button"
+            aria-label={`移除知识点 ${index + 1}`}
+            onClick={() =>
+              setItems((previous) => previous.filter((_, i) => index !== i))
+            }
+          >
+            <X size={18} />
+          </button>
+        </div>
+      ))}
+      {duplicate && (
+        <p className="text-wrong" role="status">
+          知识点名称不能重复。
+        </p>
+      )}
+      <div className="button-row">
+        <button
+          className="text-button"
+          disabled={items.length >= 6}
+          onClick={() =>
+            setItems((previous) => [
+              ...previous,
+              { title: "", description: "", checked: true },
+            ])
+          }
+        >
+          <Plus size={18} />
+          新增知识点
+        </button>
+        <button
+          className="button primary"
+          disabled={busy || missing || duplicate || !selected.length}
+          onClick={() =>
+            onConfirm(
+              selected.map((item) => ({
+                title: item.title.trim(),
+                description: item.description.trim(),
+              })),
+            )
+          }
+        >
+          {busy ? <Loader2 size={18} className="spin" /> : <Check size={18} />}
+          确认并生成练习
+        </button>
+      </div>
+    </section>
+  );
 }

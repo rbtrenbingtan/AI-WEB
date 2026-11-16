@@ -6,11 +6,13 @@ import inspect
 import json
 import os
 import time
-from typing import Callable
+from typing import Callable, TypeVar, overload
 
 import httpx
+from pydantic import BaseModel, ValidationError
 
-PROMPT_VERSION = "zhizheng-v2.1"
+PROMPT_VERSION = "zhizheng-v2.2"
+ModelOutput = TypeVar("ModelOutput", bound=BaseModel)
 
 
 class ModelError(RuntimeError):
@@ -89,6 +91,9 @@ class LLMClient:
             except ModelError as exc:
                 error = exc
                 record["error_type"] = exc.kind
+            except asyncio.CancelledError:
+                record["status"], record["error_type"] = "interrupted", "cancelled"
+                raise
             except (ValueError, TypeError) as exc:
                 error = ModelError("invalid_structure", "模型服务返回格式不正确")
                 record["error_type"] = error.kind
@@ -100,7 +105,16 @@ class LLMClient:
             await asyncio.sleep(0.6)
         raise ModelError("unknown", "模型请求失败")
 
-    async def chat(self, document_id: str, purpose: str, system: str, data: dict, *, review=False) -> dict:
+    @overload
+    async def chat(self, document_id: str, purpose: str, system: str, data: dict, *,
+                   review: bool = False, output_schema: type[ModelOutput]) -> ModelOutput: ...
+
+    @overload
+    async def chat(self, document_id: str, purpose: str, system: str, data: dict, *,
+                   review: bool = False, output_schema: None = None) -> dict: ...
+
+    async def chat(self, document_id: str, purpose: str, system: str, data: dict, *,
+                   review: bool = False, output_schema: type[BaseModel] | None = None) -> dict | BaseModel:
         model = self.review_model if review else self.model
         body = {"model": model, "messages": [{"role": "system", "content": system},
                                              {"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
@@ -112,7 +126,11 @@ class LLMClient:
                 output = json.loads(content)
                 if not isinstance(output, dict):
                     raise ValueError()
+                if output_schema is not None:
+                    return output_schema.model_validate(output)
                 return output
+            except ValidationError as exc:
+                raise ModelError("invalid_schema", "模型 JSON 不符合要求的字段结构") from exc
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 raise ModelError("invalid_json", "模型未返回要求的 JSON 对象") from exc
         return await self._post(document_id, purpose, model,

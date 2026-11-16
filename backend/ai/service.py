@@ -47,14 +47,31 @@ class Review(BaseModel):
     evidence_sufficient: bool
     other_defensible: list[str]
     issues: list[str]
+    option_misconception_ids: dict[str, str | None]
+
+
+class MisconceptionJudgment(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    id: str
+    refuted_by_evidence: bool
+    reason: str = Field(min_length=1, max_length=1200)
+
+
+class MisconceptionReview(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    topic_supported: bool
+    judgments: list[MisconceptionJudgment] = Field(max_length=6)
 
 
 class AIService:
+    misconception_review_source = f"model_refutation_reviewed:{PROMPT_VERSION}"
+
     def __init__(self, logger=None, budget_reserver=None, cache_dir: str | Path = "data/vectors"):
         self.client = LLMClient(logger, budget_reserver)
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.last_generation_stats = {}
+        self.last_misconception_stats = {}
 
     async def candidate_topics(self, document_id: str, pages: list[dict]) -> list[dict]:
         headings = []
@@ -110,6 +127,8 @@ class AIService:
         chunks = [c for c in chunks if c.get("document_id", document_id) == document_id]
         if not chunks or not valid_sentences:
             return {"sentences": [], "chunk_ids": []}
+        if not set(required_ids or []).issubset(valid_sentences):
+            raise ModelError("missing_refutation", "纠正句不属于当前资料，不能生成针对该误区的题目")
         # Backend may store only first/last sentence order rather than redundant IDs/text.
         chunks = [dict(c) for c in chunks]
         for c in chunks:
@@ -134,11 +153,14 @@ class AIService:
             if set(required_ids or []) & set(chunk["sentence_ids"]) and i not in selected:
                 selected.append(i)
         ids = {sid for i in selected for sid in chunks[i]["sentence_ids"]}
+        if not set(required_ids or []).issubset(ids):
+            raise ModelError("missing_refutation", "纠正句没有对应检索片段，请重新建立资料索引")
         evidence = [s for s in valid_sentences.values() if s["id"] in ids]
         evidence.sort(key=lambda s: (s["page_index"], s.get("ord", 0)))
         return {"sentences": evidence, "chunk_ids": [chunks[i]["id"] for i in selected]}
 
     async def misconceptions(self, document_id: str, topic: dict, evidence: dict) -> list[dict]:
+        self.last_misconception_stats = {"candidates": 0, "invalid": 0, "review_rejected": 0, "accepted": 0}
         sentences = evidence["sentences"]
         if not sentences:
             return []
@@ -150,27 +172,75 @@ class AIService:
         valid_ids = {s["id"] for s in sentences if s.get("document_id", document_id) == document_id}
         items, labels = [], set()
         for item in raw[:6]:
+            self.last_misconception_stats["candidates"] += 1
             try:
                 candidate = MisconceptionCandidate.model_validate(item).model_dump()
             except ValidationError:
+                self.last_misconception_stats["invalid"] += 1
                 continue
             if not set(candidate["refute_sentence_ids"]).issubset(valid_ids) or candidate["label"] in labels:
+                self.last_misconception_stats["invalid"] += 1
                 continue
             labels.add(candidate["label"])
             digest = hashlib.sha256((topic["id"] + candidate["label"] + "|".join(candidate["refute_sentence_ids"])).encode()).hexdigest()[:16]
             candidate.update(id="m_" + digest, topic_id=topic["id"], source="model_evidence_anchored")
             items.append(candidate)
-        return items if len(items) >= 3 else []
+        if len(items) < 3:
+            return []
+        return await self.verify_misconceptions(document_id, topic, evidence, items, preserve_stats=True)
 
-    async def _review(self, document_id: str, question: dict, evidence: dict) -> tuple[bool, list[str]]:
+    async def verify_misconceptions(self, document_id: str, topic: dict, evidence: dict,
+                                   items: list[dict], *, preserve_stats: bool = False) -> list[dict]:
+        """Recheck stored claims without changing stable IDs or silently regenerating them."""
+        if not preserve_stats:
+            self.last_misconception_stats = {"candidates": len(items), "invalid": 0, "review_rejected": 0, "accepted": 0}
+        sentences = evidence["sentences"]
+        valid_ids = {s["id"] for s in sentences if s.get("document_id", document_id) == document_id}
+        if not 3 <= len(items) <= 6 or len({m.get("id") for m in items}) != len(items):
+            raise ModelError("invalid_misconceptions", "误区复核需要 3—6 条不同的有效误区")
+        for item in items:
+            try:
+                parsed = MisconceptionCandidate.model_validate({field: item.get(field) for field in
+                    ("label", "description", "refute_sentence_ids")})
+            except ValidationError as exc:
+                raise ModelError("invalid_misconceptions", "既有误区结构不完整，无法进行证据复核") from exc
+            if (not isinstance(item.get("id"), str) or not item["id"] or item.get("topic_id") != topic["id"]
+                    or not set(parsed.refute_sentence_ids).issubset(valid_ids)):
+                raise ModelError("invalid_misconceptions", "误区或纠正句不属于当前知识点的证据包")
+        # Existence of a quote is not semantic support. Independently check that the
+        # retrieved material covers the topic and the specific cited sentences refute each claim.
+        verdict = await self.client.chat(document_id, "review_misconceptions", prompt("review_misconceptions"),
+                                        {"topic": {"title": topic["title"], "description": topic.get("description", "")},
+                                         "misconceptions": items,
+                                         "sentences": [{"id": s["id"], "text": s["text"]} for s in sentences if s["id"] in valid_ids]},
+                                        review=True, output_schema=MisconceptionReview)
+        if not verdict.topic_supported:
+            self.last_misconception_stats["review_rejected"] = len(items)
+            raise ModelError("insufficient_topic_evidence", "检索原文不能充分支持这个知识点，请调整知识点或补充资料")
+        expected = {m["id"] for m in items}
+        actual = [j.id for j in verdict.judgments]
+        if set(actual) != expected or len(actual) != len(expected):
+            raise ModelError("invalid_schema", "误区复核必须逐条覆盖所有候选误区且不得重复")
+        supported = {j.id for j in verdict.judgments if j.refuted_by_evidence}
+        self.last_misconception_stats["review_rejected"] = len(items) - len(supported)
+        verified = [{**m, "source": self.misconception_review_source} for m in items if m["id"] in supported]
+        if len(verified) < 3:
+            return []
+        self.last_misconception_stats["accepted"] = len(verified)
+        return verified
+
+    async def _review(self, document_id: str, question: dict, evidence: dict, misconceptions: list[dict]) -> tuple[bool, list[str]]:
         selected = set(question["evidence_sentence_ids"])
         data = {"stem": question["stem"], "options": [{"letter": o["letter"], "text": o["text"]} for o in question["options"]],
-                "sentences": [{"id": s["id"], "text": s["text"]} for s in evidence["sentences"] if s["id"] in selected]}
-        output = await self.client.chat(document_id, "blind_review", prompt("review"), data, review=True)
+                "sentences": [{"id": s["id"], "text": s["text"]} for s in evidence["sentences"] if s["id"] in selected],
+                "misconceptions": [{"id": m["id"], "label": m.get("label", ""), "description": m.get("description", "")} for m in misconceptions]}
+        # Only the catalog is sent; no target ID or author-assigned option mapping is disclosed.
         try:
-            review = Review.model_validate(output)
-        except ValidationError:
-            return False, ["复核返回格式不合法"]
+            review = await self.client.chat(document_id, "blind_review", prompt("review"), data, review=True, output_schema=Review)
+        except ModelError as exc:
+            if exc.kind in ("invalid_json", "invalid_schema"):
+                return False, ["复核返回格式不合法"]
+            raise
         errors = []
         if review.answer_letter != question["answer_letter"]:
             errors.append("盲答与预期答案不同")
@@ -178,6 +248,9 @@ class AIService:
             errors.append("证据不足")
         if review.other_defensible:
             errors.append("存在其他可辩护选项：" + "、".join(review.other_defensible))
+        expected_mapping = {o["letter"]: None if o["is_correct"] else o["misconception_id"] for o in question["options"]}
+        if review.option_misconception_ids != expected_mapping:
+            errors.append("独立复核对选项的误区归属与作者标注不一致，需修正选项或误区绑定")
         errors.extend(review.issues)
         return not errors, errors
 
@@ -185,10 +258,12 @@ class AIService:
                                   evidence: dict, existing_stems: list[str], parent_id: str | None = None) -> list[dict]:
         stats = {"requested": 0, "code_rejected": 0, "review_rejected": 0, "repair_attempted": 0, "accepted": 0}
         self.last_generation_stats = stats
-        allowed = {m["id"] for m in misconceptions if m.get("topic_id", topic["id"]) == topic["id"]}
+        allowed = {m["id"] for m in misconceptions if m.get("topic_id") == topic["id"]
+                   and m.get("source") == self.misconception_review_source}
         valid_evidence = {s["id"] for s in evidence["sentences"] if s.get("document_id", document_id) == document_id}
-        if target_id not in allowed or not valid_evidence:
+        if len(allowed) < 3 or target_id not in allowed or not valid_evidence:
             return []
+        misconceptions = [m for m in misconceptions if m["id"] in allowed]
         request = {"topic": topic, "misconceptions": misconceptions, "target_misconception_id": target_id,
                    "sentences": [{"id": s["id"], "text": s["text"]} for s in evidence["sentences"] if s["id"] in valid_evidence],
                    "existing_stems": existing_stems[-150:]}
@@ -199,37 +274,44 @@ class AIService:
         if not isinstance(candidates, list):
             raise ModelError("invalid_questions", "模型题目格式不正确")
         published, seen_stems = [], list(existing_stems)
-        for candidate in candidates[:2]:
-            stats["requested"] += 1
-            for revision in range(2):
-                checked = validate_question(candidate, allowed, valid_evidence, seen_stems, target_id)
-                errors = checked["errors"]
-                question = checked["question"]
-                if errors:
-                    stats["code_rejected"] += 1
-                else:
-                    accepted, errors = await self._review(document_id, question, evidence)
-                    if accepted:
-                        question.update({"id": "q_" + uuid.uuid4().hex, "document_id": document_id, "topic_id": topic["id"],
-                                         "kind": "concept", "parent_id": parent_id, "validation_status": "verified",
-                                         "review_note": "代码校验与独立盲答复核通过；不代表人工审定",
-                                         "prompt_version": PROMPT_VERSION, "model": self.client.model,
-                                         "review_model": self.client.review_model, "origin": "live" if parent_id else "bank",
-                                         "source_note": "模型生成 · 代码校验及盲答复核通过"})
-                        published.append(question)
-                        seen_stems.append(question["stem"])
-                        stats["accepted"] += 1
-                        break
-                    stats["review_rejected"] += 1
-                if revision == 0:
-                    stats["repair_attempted"] += 1
-                    repaired = await self.client.chat(document_id, "repair", prompt("generate"),
-                                                      {**request, "candidate": candidate, "repair_feedback": errors,
-                                                       "existing_stems": seen_stems[-150:]})
-                    repaired_questions = repaired.get("questions", [])
-                    if repaired.get("insufficient") is True or not isinstance(repaired_questions, list) or not repaired_questions:
-                        break
-                    candidate = repaired_questions[0]
+        try:
+            for candidate in candidates[:2]:
+                stats["requested"] += 1
+                for revision in range(2):
+                    checked = validate_question(candidate, allowed, valid_evidence, seen_stems, target_id)
+                    errors = checked["errors"]
+                    question = checked["question"]
+                    if errors:
+                        stats["code_rejected"] += 1
+                    if not errors:
+                        accepted, errors = await self._review(document_id, question, evidence, misconceptions)
+                        if accepted:
+                            question.update({"id": "q_" + uuid.uuid4().hex, "document_id": document_id, "topic_id": topic["id"],
+                                             "kind": "concept", "parent_id": parent_id, "validation_status": "verified",
+                                             "review_note": "代码校验、独立盲答与误区绑定复核通过；不代表人工审定",
+                                             "prompt_version": PROMPT_VERSION, "model": self.client.model,
+                                             "review_model": self.client.review_model, "origin": "live" if parent_id else "bank",
+                                             "source_note": "模型生成 · 代码校验及盲答复核通过"})
+                            published.append(question)
+                            seen_stems.append(question["stem"])
+                            stats["accepted"] += 1
+                            break
+                        stats["review_rejected"] += 1
+                    if revision == 0:
+                        stats["repair_attempted"] += 1
+                        repaired = await self.client.chat(document_id, "repair", prompt("generate"),
+                                                          {**request, "candidate": candidate, "repair_feedback": errors,
+                                                           "existing_stems": seen_stems[-150:]})
+                        repaired_questions = repaired.get("questions", [])
+                        if repaired.get("insufficient") is True or not isinstance(repaired_questions, list) or not repaired_questions:
+                            break
+                        candidate = repaired_questions[0]
+        except (Exception, asyncio.CancelledError):
+            # A failed batch never reaches persistence. Keep passed-but-undelivered gates
+            # separate instead of counting them as accepted returned questions.
+            stats["validated_unpublished"] = stats["accepted"]
+            stats["accepted"] = 0
+            raise
         return published
 
 
@@ -248,10 +330,16 @@ async def generate_topic(document_id, topic_id, title, description, sentences, c
     service = AIService(record_call, reserve_call, cache_dir)
     topic = {"id": topic_id, "title": title, "description": description}
     misconceptions = existing_misconceptions or []
-    required = [sid for m in misconceptions if m["id"] == target_id for sid in m["refute_sentence_ids"]]
+    needs_review = any(m.get("source") != service.misconception_review_source for m in misconceptions)
+    required = [sid for m in misconceptions if needs_review or target_id is None or m["id"] == target_id for sid in m["refute_sentence_ids"]]
     evidence = await service.build_evidence(document_id, topic, chunks, sentences, required)
     if not misconceptions:
         misconceptions = await service.misconceptions(document_id, topic, evidence)
+    if needs_review:
+        verified = await service.verify_misconceptions(document_id, topic, evidence, misconceptions)
+        if len(verified) != len(misconceptions):
+            raise ModelError("insufficient_misconception_evidence", "既有误区未全部通过当前版本原文复核，请重新导入资料")
+        misconceptions = verified
     questions, stats = [], []
     for misconception in misconceptions:
         if target_id is not None and misconception["id"] != target_id:
