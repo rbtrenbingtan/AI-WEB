@@ -4,7 +4,7 @@
 
 ## 环境
 
-- 项目 Python 3.11+ 虚拟环境和 Node.js 20.19+。
+- 项目 Python 3.11+ 虚拟环境和 Node.js 22.x（至少 22.12.0）或 24.x，详见 [环境配置指南](../../docs/environment.md)。
 - `python -m pip install -r tools/submission/requirements.txt`。
 - PDF 和视频默认使用 Windows 微软雅黑字体；PDF 可通过 `--font`、`--bold-font` 指定其他兼容中文字体。
 - 配音脚本需要 Windows PowerShell、System.Speech 和已安装的 zh-CN 声音。本次为 Microsoft Huihui Desktop，语速 2。
@@ -43,4 +43,4 @@ git bundle create submission/知证学伴-完整历史.bundle --all
 
 检查器核对 PDF 页数与章节关键词、视频时长/分辨率/音轨、源码必需文件与敏感路径、bundle 完整性，并记录 SHA-256。关键词命中不等于内容已通过评审。仍需渲染查看全部 PDF 页、播放视频确认画面和解说，并从 bundle 独立克隆验证历史。
 
-本地材料目录被 Git 忽略，以免把生成视频和重复源码提交进历史；本工具目录会正常跟踪。源码 ZIP 不带 `.git`，完整历史在 `.bundle` 中。正式参赛时仍需按比赛要求发布评审可访问的 GitHub/Gitee 仓库，并在规定截止时间前提交。
+本地材料目录被 Git 忽略，以免把生成视频和重复源码提交进历史；本工具目录会正常跟踪。源码 ZIP 不带 `.git`，完整历史在 `.bundle` 中，也可直接克隆 [公开代码仓库](https://github.com/rbtrenbingtan/AI-WEB) 获取历史。正式参赛时仍需在规定截止时间前向赛事系统提交仓库地址和材料。
