@@ -263,7 +263,7 @@ def check_bundle(path: Path) -> dict:
         result['details']['refs'] = refs
         if not refs:
             result['errors'].append('bundle 没有可恢复的提交引用')
-        result['warnings'].append('仅验证本地历史包；未发布远程仓库，仍建议在独立目录克隆并按 README 复现')
+        result['warnings'].append('本检查仅验证本地历史包，不核验远程仓库发布状态；仍建议在独立目录克隆并按 README 复现')
     except subprocess.TimeoutExpired:
         result['errors'].append('Git 历史包验证超时')
     except OSError as exc:
