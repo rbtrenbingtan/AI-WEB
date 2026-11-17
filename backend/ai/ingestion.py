@@ -9,6 +9,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
+import time
 
 
 class PDFError(ValueError):
@@ -18,6 +20,10 @@ class PDFError(ValueError):
 def _memory_limit() -> None:
     # A process cap prevents a tiny compressed PDF from exhausting the application host.
     memory_bytes = 512 * 1024 * 1024
+    if sys.platform == "darwin":
+        # macOS maps shared system libraries above this virtual-address limit.
+        # The parent enforces the RSS budget in _run_macos_worker instead.
+        return
     if os.name != "nt":
         import resource
         resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
@@ -45,6 +51,52 @@ def _memory_limit() -> None:
     limits.ProcessMemoryLimit = memory_bytes
     if not job or not kernel.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)) or not kernel.AssignProcessToJobObject(job, kernel.GetCurrentProcess()):
         raise PDFError("无法启用 PDF 解析内存限制")
+
+
+def _run_macos_worker(command: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """Watch resident memory on macOS, where RLIMIT_AS cannot cap RSS."""
+    deadline = time.monotonic() + timeout
+    # Files avoid pipe backpressure while the parent samples the worker.
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        process = subprocess.Popen(command, stdout=output, stderr=errors)
+        try:
+            while process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    sample = subprocess.run(
+                        ["/bin/ps", "-o", "rss=", "-p", str(process.pid)],
+                        capture_output=True, text=True, timeout=min(0.5, remaining),
+                    )
+                    if sample.returncode:
+                        raise ValueError("ps failed")
+                    resident_kib = int(sample.stdout.strip())
+                    if resident_kib < 0:
+                        raise ValueError("invalid resident memory")
+                except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                    if deadline - time.monotonic() <= 0:
+                        raise subprocess.TimeoutExpired(command, timeout) from exc
+                    # ps can lose the race with a successfully exiting worker.
+                    if process.poll() is not None:
+                        break
+                    raise PDFError("无法监测 PDF 解析内存，已终止解析") from exc
+                if resident_kib > 512 * 1024:
+                    raise PDFError("PDF 解析超过 512 MiB 内存限制，已终止")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    process.wait(timeout=min(0.05, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+        except BaseException:
+            process.kill()
+            process.wait()
+            raise
+        output.seek(0)
+        errors.seek(0)
+        return subprocess.CompletedProcess(command, process.returncode, output.read(), errors.read())
 
 
 def split_pages(pages: list[dict], document_id: str) -> dict:
@@ -134,8 +186,12 @@ def parse_pdf(path: str | Path, document_id: str, timeout: float = 60) -> dict:
         if file.read(5) != b"%PDF-":
             raise PDFError("文件不是有效的 PDF")
     try:
-        process = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker", str(path), document_id],
-                                 capture_output=True, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        command = [sys.executable, str(Path(__file__).resolve()), "--worker", str(path), document_id]
+        if sys.platform == "darwin":
+            process = _run_macos_worker(command, timeout)
+        else:
+            process = subprocess.run(command, capture_output=True, timeout=timeout,
+                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     except subprocess.TimeoutExpired as exc:
         raise PDFError("PDF 解析超过 60 秒，已终止；请简化文件后重试") from exc
     if process.returncode != 0:
